@@ -1,0 +1,292 @@
+---
+title: "Smolt length correction"
+author: "Nora Hanson, Tania Mendo, Gordon Smith, Chris Todd"
+date: "November 2017"
+output:
+  word_document: default
+  pdf_document: default
+  html_document: default
+institute: Marine Scotland Science & University of St Andrews
+fontsize: 12pt
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(comment = "", message = FALSE, warning = FALSE)
+```
+
+## Back calculation
+
+Length of smolts at emigration usually back calculated from scales sampled from return adults
+
+* Assumes linear relationship between growth in length of fish and growth along major axis of scale
+
+**this is probably wrong**
+- because fish/scale growth allometry for small freshwater fish unlikely to be the same for large adults experiencing rapid growth
+
+```{r global options, include=FALSE}
+knitr::opts_chunk$set(collapse = TRUE)
+knitr::knit_hooks$set(mysize = function(before, options, envir) {
+  if (before) 
+    return(options$size)
+})
+```
+
+```{r libraries, include=FALSE}
+rm(list=ls(all=TRUE))
+
+library(dplyr)
+library(tidyr)
+library(scales)
+library(lazyeval)
+library(tidyverse)
+library(broom)
+library(modelr)
+```
+
+## Data
+
+```{r data print, include=FALSE}
+getwd()
+setwd("C:/Users/MyComputer/Dropbox/Chris salmon data/smolt correction")
+Dat <- readxl::read_excel("171025_smolt_correction.xlsx", sheet="Nora_forR")
+# delete 'bad' scales
+Dat[which(Dat$id=="c56005"),"cdt_delete"]
+Dat<- filter(Dat,is.na(cdt_delete))
+Dat[which(Dat$id=="c56005"),]
+
+# add calculations
+Dat <- Dat %>%
+  group_by(id) %>%
+  mutate(runoutcm=(eor-um_parr_end)/scale_edg * length_cm,
+         smoltcm= (eor/scale_edg) * length_cm,
+         prop_intact = 1-(um_parr/eor))
+
+# which lengths rounded?
+Dat$rounded <- NA
+#this is to identify which smolts were rounded during measurements:
+onecm <- grep(".0", sprintf("%0.1f",Dat$smolt_cm_obs)) # converts numeric to character keeping 1 sf and finds index
+halfcm <- grep(".5", sprintf("%0.1f",Dat$smolt_cm_obs))
+Dat[onecm,"rounded"] <- 1
+Dat[halfcm,"rounded"] <- 1
+```
+
+MSS has `r length(unique(Dat$id))` observations of salmon that were tagged as smolts, measured and scaled, then subsequently recaptured as return migrant adults, measured and scaled. Between 1 and 7 scales were retreived from adults. These adult scales were read by CDT to back caclulate smolt length at emigration. Imporantly, smolt length includes any runout determined by reader.
+
+```{r data plot, echo=FALSE}
+ggplot(Dat,aes(smoltcm,smolt_cm_obs)) + geom_point(aes(col=id)) + theme_bw() + theme(legend.position = "none") + xlab("Back calculated smolt length (cm)") + ylab("Observed smolt length (cm)") + geom_abline(lty="dashed") + labs(caption="Dashed line gives 1:1 relationship")
+
+ggplot(Dat,aes(smoltcm,smolt_cm_obs)) + geom_point(aes(col=as.factor(sea_age))) + theme_bw()  + xlab("Back calculated smolt length (cm)") + ylab("Observed smolt length (cm)") + geom_abline(lty="dashed") + labs(caption="Dashed line gives 1:1 relationship")
+
+```
+
+***the AIM*** 
+- is to derive an empirical relationship between observed 'true' smolt length and back-calculated smolt length for the purpose of predicting 'true' length from back-calculated smolt length of fish that were not captured and tagged as smolts.
+
+## OLS regression
+
+CDT takes single ***good quality*** scale (median back-calculated length) from each individual fish to compute regression coefficients. 
+
+* Can do the same in R, taking the same scales and ***weighting*** by the number of scales measured: 
+***and adding sea age because there is some suggestion from the plots the relationship might be different***
+
+```{r OLS, include=FALSE}
+# chris used single scale from each fish weighted by number of scales
+cdt <- filter(Dat, cdt_wt>0)
+
+summary(ols <- lm(smolt_cm_obs~smoltcm,weights=cdt_wt,data=cdt))
+confint(ols)
+
+plot(fitted(ols),resid(ols))
+plot(resid(ols))
+
+summary(lm(length_cm ~ scale_edg, data=cdt))
+summary(lm(length_cm ~ scale_edg + sea_age, data=cdt))
+## why are 2SW fish longer for a given scale radius ??
+```
+
+```{r OLS sea age, echo=FALSE}
+summary(ols1 <- lm(smolt_cm_obs~smoltcm + sea_age,weights=cdt_wt,data=cdt))
+
+ggplot(cdt,aes(smoltcm,smolt_cm_obs)) + geom_point(aes(size=cdt_wt,col=factor(sea_age))) + geom_smooth(aes(col=factor(sea_age)),method="lm",weight="cdt_wt") + geom_smooth(method="lm",weight="cdt_wt",col="black",size=1) + theme_bw() +  xlab("Back calculated smolt length (cm)") + ylab("Observed smolt length (cm)") + geom_abline(lty="dashed") + scale_color_discrete("Sea age") + scale_size_continuous("Number scales") + labs(caption="Dashedlack line gives 1:1 relationship")
+
+```
+
+It looks from the above plot that we might need to include or at least explore a different correction relationship between back calculated and 'true' smolt length for the two sea age classes. It is possible that scale growth allometry changes with fish age. We will test for this in subsequent models.
+
+## Scale-to-scale and measurement variability 
+
+There is a fair amount of variability in back-calculated lengths from differnet scales from the same fish (1-2cm in some cases). In practice, it is generaly only feasible to read one scale - hopefully a good quality one - for age determination and growth increment analysis.
+
+***so how much variability in the fitted regression line(s) is introduced by scale-to-scale variability?***
+
+Furthermore, 'true' smolt length is usually recorded rounded down to the nearest 0.5cm, so we have in fact variability in (y) measurements as well. In some cases lengths were measureed more accurately (indicated by values between .0 and .5). In these instances we take this measure as the best estimate of true smolt length. 
+
+```{r potential variability plot, echo=FALSE, results='hide'}
+sumDat <- Dat %>%
+  group_by(id) %>%
+  summarise(mnsmoltcm = mean(smoltcm), obssmoltcm = head(smolt_cm_obs,1), sdsmoltcm = sd(smoltcm), rounded=head(rounded,1))
+
+sumDat
+
+ggplot(sumDat,aes(mnsmoltcm,obssmoltcm,col=id)) + geom_point() + geom_errorbarh(aes(xmin=mnsmoltcm-sdsmoltcm,xmax=mnsmoltcm+sdsmoltcm)) + geom_errorbar(data=filter(sumDat, rounded==1),aes(ymin=obssmoltcm, ymax=obssmoltcm+0.5))+ theme_bw() + theme(legend.position = "none") + xlab("Back calculated smolt length (cm)") + ylab("Observed smolt length (cm)") + geom_abline()
+
+```
+
+Variability in both (x) and (y) is not uncommon in ecological datasets. Because the purpose of this exercise is to derived the best possible predictve equation given the data we take an ordinary least squares regression approach. To incorporate error in the observation of 'true' smolt length and scale-to-scale variability in back-calculated smolt length, we adopt a sort of bootstrap approach.   
+
+### An approach to bootstrap best predictive equation
+```{r generate data, include=FALSE}
+# Need to sample very many times
+samp <- function(df){
+  nDat <- df %>%
+  group_by(id) %>% ## split by fishID
+  select(id, smolt_cm_obs, smoltcm, sea_age, river_age, rounded) %>% # select necessary rows
+  sample_n(1, replace=T) %>% # sample one observation of x (between 1:7) with replacement
+  mutate(newy = ifelse(is.na(rounded),smolt_cm_obs, smolt_cm_obs + runif(1, 0, 0.5))) # sample uniform distribuiton from y to y + 0.5 cm (because lengths rounded down) IF those lengths were rounded down
+return(nDat)
+}
+
+# n <- 1000 # number of times you need to repeat the process
+# out <- vector("list", n)
+# for (i in 1:n) out[[i]] <- samp(Dat)
+# (sampDat <- tibble(iteration=paste(1:n),newdat=out))
+# saveRDS(sampDat,"sampleData.rds")
+sampDat <- readRDS("sampleData.rds")
+#sampDat[[2]]
+```
+
+#### 1. Generate a set of 1000 'new' datasets with a single observation per fish creating 2 new variables:
+
+  - ***newx*** which is a random sample, with replacement, of the back-calculated smolt length from one of the different scales within each fish. If only one scale was measured, that value was fixed. 
+
+  - ***newy*** which the observed 'true' smolt length with added 'error' up to 0.5cm that is sampled randomly from a uniform distribution. If the observed smolt length was measured without rounding down to nearest 0.5cm, that value was fixed. 
+
+#### 2. Fit a candidate set of linear regression models to each re-sampled dataset, assess the AIC and BIC values of candidate models and the significances of each term within them.
+
+  - ***Model 1*** smolt lenth ~ intercept only (null)
+  - ***Model 2*** smolt lenth ~ back-calculated smolt
+  - ***Model 3*** smolt lenth ~ back-calculated smolt + sea age
+  - ***Model 4*** smolt lenth ~ separate slopes back-calculated smolt + sea age
+  - ***Model 5*** smolt lenth ~ separate slopes and intercepts back-calculated smolt + sea age
+
+```{r aic bic, echo=FALSE}
+# 4. fit other models and assess info crit
+mods <- function(df){
+  m1 <- lm(newy ~ 1, data=df)
+  m2 <- lm(newy ~ smoltcm, data=df)
+  m3 <- lm(newy ~ smoltcm + sea_age, data=df)
+  m4 <- lm(newy ~ smoltcm:sea_age, data=df)
+  m5 <- lm(newy ~ smoltcm + sea_age + smoltcm:sea_age, data=df)
+  aic <- AIC(m1,m2,m3,m4,m5)
+  bic <- BIC(m1,m2,m3,m4,m5)
+  info <- data.frame(crit=c("AIC","BIC"), min=c(which.min(aic$AIC),which.min(bic$BIC)))
+  return(info)
+}
+
+sampDat <- sampDat %>%
+  mutate(moremods = map(.$newdat, mods))
+
+modfits <- unnest(sampDat, moremods, .drop=T) 
+modfreq <- modfits %>%
+  group_by(crit) %>%
+  count(min) %>%
+  mutate(propr = n/1000)
+
+ggplot(modfreq, aes(min,propr)) + geom_bar(stat="identity") + facet_wrap(~crit) + xlab("Model") + ylab("Proportion minimum value") + theme_bw()
+```
+
+AIC and BIC are two slightly different information criteria. AIC assumes all models specified are appoximations of reality and that no candidate model is in fact true. It penalises complex models but not as much as BIC. BIC assumes that one of the canidate models is in fact 'true' (which some find problematic philosophically). Below is the proportion of models with a minimum AIC or BIC value. As you can see, both information criteria select model 2, although AIC 'prefers' in some instances a more complex model about 30% of the time.
+
+The more complex model (5) inclues a full interaction between back-calculated smolt lengthand sea age. Within this model, we find that a smoltcm (back-calculated smolt length):sea age interaction is only significant in about 10% of the iterations.
+
+***Conclusion*** little consistent support for inclusion of sea age / back-calculated smolt length interaction. Most parsimonious model predicts 'true' smolt length only as a function of back-calculated smolt length. 
+
+```{r significant terms, echo=FALSE}
+## significance of model terms in 'full model'
+sampDat.unnest <- unnest(sampDat,newdat)
+regressions <- sampDat.unnest %>% 
+    group_by(iteration) %>%
+    do(fit1 = lm(newy ~ 1, .), fit2 = lm(newy ~ smoltcm, .), fit3 = lm(newy ~ smoltcm + sea_age, .), fit4 = lm(newy ~ smoltcm:sea_age, .), fit5 = lm(newy ~ smoltcm + sea_age + smoltcm:sea_age, .))
+
+# examine full fit
+fit5 <- regressions %>% tidy(fit5)
+fit5 %>%
+  ggplot(aes(p.value))+
+  geom_histogram() + 
+  facet_wrap(~term) + 
+  geom_vline(aes(xintercept=0.05),size=1,col="red") + 
+  xlab("p-value") + ylab("Frequency") +
+  theme_bw()
+
+#fit5 %>%
+#  group_by(term) %>%
+#  count(p.value<0.05) # smoltcm:sea_age sig 13% of the time; sea age 8%
+```
+
+#### 3. Calculate an average predictive relationship from the 'best' model over all data samples.
+  - We take model 2 to be the 'best' model. The plot below shows the linear model coefficients from the single scale model and the mean values from re-sampled data.
+  
+```{r best model fit, include=FALSE}
+mainmod <- function(df){
+  lm(newy ~ smoltcm, data=df)
+} 
+
+sampDat <- sampDat %>%
+  mutate(model = map(.$newdat, mainmod))
+
+# add predictions from all models 
+(sampDat <- sampDat %>%
+  mutate(preds = map2(.$newdat, .$model, add_predictions)))
+
+# add residuals from all models and examine patterns
+sampDat <- sampDat %>%
+  mutate(resids = map2(.$newdat, .$model, add_residuals))
+
+regressions %>% 
+  tidy(fit2) %>%
+  #group_by(term) %>%
+  #mutate(mn = mean(estimate), mnse = mean(std.error), sd = sd(estimate)) +
+    ggplot(aes(estimate))+
+    geom_histogram() + 
+    facet_wrap(~term, scales="free") +
+    xlab("Coefficient estimate")
+
+sumreg <- regressions %>% 
+  tidy(fit2) %>%
+  group_by(term) %>%
+  summarise(estimate = mean(estimate), std.error = mean(std.error)) 
+sumreg <- rbind(sumreg,tidy(ols)[,1:3])
+sumreg$source <- c("resampled","resampled","single scale","single scale")
+```
+
+```{r coef comparison, echo=FALSE}
+ggplot(sumreg,aes(source, estimate)) + geom_point() + geom_errorbar(aes(source, ymin=estimate-1.96*std.error, ymax=estimate+1.96*std.error))  + facet_wrap(~term, scales="free") + xlab("") + ylab("Coefficient estimate") + theme_bw()
+
+```
+  
+  - 'True' smolt length = `r as.numeric(select(filter(sumreg, source=="resampled"), estimate)[1,])` + back-calculated smolt length * `r as.numeric(select(filter(sumreg, source=="resampled"), estimate)[2,])`
+
+```{r best model plot, echo=FALSE}
+preds <- unnest(sampDat, preds)
+preds %>%
+  ggplot(aes(smoltcm,pred))+
+  geom_smooth(data=cdt,aes(smoltcm, smolt_cm_obs), method="lm",lty="dashed",size=1)+
+  geom_abline(aes(slope=as.numeric(select(filter(sumreg, source=="resampled"), estimate)[2,]), intercept=as.numeric(select(filter(sumreg, source=="resampled"), estimate)[1,])),col="red",size=2)+
+  geom_line(aes(group=iteration),alpha=0.05)+
+  geom_abline(lty="dotted", size=1) +
+  theme_bw() +
+  theme(legend.position = "none")+
+  ylab("Predicted true smolt length (cm)") + xlab("Back-calculated smolt length (cm)") + 
+  labs(captions="Dotted line = 1:1 line; blue line = single scale; red line = mean fit from resampled data; black lines = fitted line from 1000 data resamples")
+
+# resids <- unnest(sampDat, resids)
+ # resids %>%
+ #   ggplot(aes(smoltcm,resid))+
+ #   geom_point(aes(col=iteration))+
+ #   geom_smooth(se=F)+
+ #   theme(legend.position = "none")
+    # suggests fit never does a great job at very small end of smolts: to ofew data points?
+```
+
+***Conclusion***
+* Dahl-Lea method assumes linearity between growth of scale and growth, in length, of fish. In reality, the method overestimates size of larger smolts by over 1cm and underestimates length of smaller smolts by ~ 1cm.
+* The difference betwen using the single scale model and the average resampled model amounts to < 0.5cm for small smolts and makes no difference for larger smolts.
